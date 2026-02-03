@@ -1,0 +1,5 @@
+max_trades_per_day: 5
+max_daily_loss: 2000
+risk_per_trade_pct: 0.5
+sl_points:
+  scalping: 15
