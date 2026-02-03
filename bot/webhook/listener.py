@@ -6,7 +6,9 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from bot.core.order_manager import OrderManager, OrderRequest
+from bot.core.order_manager import OrderManager
+from bot.core.order_types import OrderRequest
+from bot.core.trading_control import TradingControl
 from bot.strategy.scalping_logic import Signal, TradePlan
 from bot.strategy.signal_router import SignalRouter, SignalContext
 from bot.utils.logger import setup_logger
@@ -37,9 +39,27 @@ def create_app(
     order_manager: OrderManager,
     signal_ttl_seconds: int,
     spot_price_provider: callable,
+    trading_control: TradingControl,
 ) -> FastAPI:
     logger = setup_logger("Webhook")
     app = FastAPI()
+
+    @app.get("/control/status")
+    def control_status() -> dict[str, Any]:
+        state = trading_control.status()
+        return {"enabled": state.enabled, "updated_at": state.updated_at, "reason": state.reason}
+
+    @app.post("/control/enable")
+    def control_enable(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        reason = payload.get("reason") if payload else None
+        state = trading_control.enable(reason=reason)
+        return {"enabled": state.enabled, "updated_at": state.updated_at, "reason": state.reason}
+
+    @app.post("/control/disable")
+    def control_disable(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        reason = payload.get("reason") if payload else None
+        state = trading_control.disable(reason=reason)
+        return {"enabled": state.enabled, "updated_at": state.updated_at, "reason": state.reason}
 
     @app.post("/signal")
     def handle_signal(payload: WebhookPayload) -> dict[str, Any]:
@@ -55,10 +75,15 @@ def create_app(
             raise HTTPException(status_code=400, detail="Risk checks failed")
         sl_request = _build_stop_loss(trade_plan)
         sl_response = order_manager.place_stop_loss(sl_request)
+        target_response = None
+        if trade_plan.target_price is not None:
+            target_request = _build_target(trade_plan)
+            target_response = order_manager.place_order(target_request)
         logger.info("Signal executed", extra={"signal": payload.model_dump()})
         return {
             "entry": entry_response,
             "stop_loss": sl_response,
+            "target": target_response,
         }
 
     return app
@@ -75,4 +100,18 @@ def _build_stop_loss(trade_plan: TradePlan) -> OrderRequest:
         product_type=trade_plan.entry.product_type,
         price=trade_plan.stop_loss_price,
         order_tag="STOP_LOSS",
+    )
+
+
+def _build_target(trade_plan: TradePlan) -> OrderRequest:
+    side = "SELL" if trade_plan.entry.side == "BUY" else "BUY"
+    return OrderRequest(
+        symbol=trade_plan.entry.symbol,
+        exchange=trade_plan.entry.exchange,
+        side=side,
+        quantity=trade_plan.entry.quantity,
+        order_type="LIMIT",
+        product_type=trade_plan.entry.product_type,
+        price=trade_plan.target_price,
+        order_tag="TARGET",
     )

@@ -6,7 +6,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from bot.core.order_manager import OrderRequest
+from bot.core.order_types import OrderRequest
 from bot.core.position_manager import PositionManager
 from bot.utils.logger import setup_logger
 
@@ -16,6 +16,7 @@ class RiskLimits:
     max_trades_per_day: int
     max_daily_loss: float
     risk_per_trade_pct: float
+    capital: float | None = None
 
 
 class RiskManager:
@@ -46,12 +47,25 @@ class RiskManager:
         state = self._reset_if_new_day(self._load_state())
         if request.order_tag == "STOP_LOSS":
             return True
+        if request.order_tag == "TARGET":
+            return True
         if state["trades"] >= self._limits.max_trades_per_day:
             self._logger.warning("Max trades per day reached")
             return False
         if state["daily_loss"] >= self._limits.max_daily_loss:
             self._logger.warning("Max daily loss reached")
             return False
+        if self._limits.capital is not None:
+            reference_price = request.reference_price or request.price
+            if reference_price is not None:
+                allowed = self._limits.capital * (self._limits.risk_per_trade_pct / 100)
+                notional = reference_price * request.quantity
+                if notional > allowed:
+                    self._logger.warning(
+                        "Order notional exceeds risk per trade",
+                        extra={"notional": notional, "allowed": allowed},
+                    )
+                    return False
         if self._position_manager.has_open_position(request.symbol):
             self._logger.warning("Open position exists for symbol", extra={"symbol": request.symbol})
             return False
@@ -61,7 +75,17 @@ class RiskManager:
         if request.order_tag == "STOP_LOSS":
             self._logger.info("Stop loss order recorded", extra={"symbol": request.symbol, "order": response})
             return
+        if request.order_tag == "TARGET":
+            self._logger.info("Target order recorded", extra={"symbol": request.symbol, "order": response})
+            return
         state = self._reset_if_new_day(self._load_state())
         state["trades"] += 1
+        if isinstance(response, dict) and "pnl" in response:
+            try:
+                pnl_value = float(response["pnl"])
+                if pnl_value < 0:
+                    state["daily_loss"] += abs(pnl_value)
+            except (TypeError, ValueError):
+                self._logger.warning("Invalid pnl in response", extra={"pnl": response.get("pnl")})
         self._save_state(state)
         self._logger.info("Trade recorded", extra={"symbol": request.symbol, "order": response})
